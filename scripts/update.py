@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +28,9 @@ WINDOW = 25          # 騰落レシオの期間(営業日)
 LOOKBACK_DAYS = 90   # 初回に遡る日数(カレンダー日)
 KEEP_SERIES = 60     # data.json に残す日数
 KEEP_HISTORY = 200   # history.json に残す日数
+
+STATS = Counter()
+SAMPLES = []
 
 # 「内国株式・プライム市場」の後ろに数値が14個続く行(値付/騰落銘柄数の表)
 ROW = re.compile(r"内国株式・プライム市場((?:\s+[\d,]+(?:\.\d+)?){14})")
@@ -61,16 +65,30 @@ def fetch_day(session, day):
             r = session.get(url, timeout=30)
         except requests.RequestException as e:
             err = str(e)
+            STATS["通信エラー"] += 1
         else:
             if r.status_code == 404:
+                STATS["404(ファイルなし)"] += 1
                 return None
             if r.status_code == 200:
                 if not r.content.startswith(b"%PDF"):
+                    STATS["200だがPDFではない"] += 1
+                    if len(SAMPLES) < 2:
+                        SAMPLES.append((url, r.headers.get("Content-Type", ""), r.content[:200]))
                     return None
+                STATS["PDF取得"] += 1
                 return parse_counts(extract_text(r.content), ymd)
             err = f"HTTP {r.status_code}"
+            STATS[err] += 1
         time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"{url} を取得できませんでした: {err}")
+
+
+def report():
+    """取得結果の内訳を表示する(うまくいかない原因の調査用)。"""
+    print("取得結果の内訳:", dict(STATS))
+    for url, ctype, head in SAMPLES:
+        print("PDFではない応答の例:", url, ctype, head)
 
 
 def load_json(path, default):
@@ -135,9 +153,12 @@ def main():
     if json.dumps(history, sort_keys=True) != before_history:
         save_json(HISTORY_PATH, history)
 
+    report()
     ratios = compute_ratios(days)
     if not ratios:
-        raise RuntimeError(f"騰落レシオを計算できません(取得済み{len(days)}営業日、必要{WINDOW}営業日)")
+        # 取得できた日数を保存して、日を重ねて25営業日になるのを待つ
+        print(f"まだ計算できません(取得済み{len(days)}営業日、必要{WINDOW}営業日)。取得した日数は保存しました。")
+        return
 
     old = load_json(OUTPUT_PATH, {})
     merged = {d: v for d, v in old.get("series", [])}
